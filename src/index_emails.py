@@ -1,4 +1,4 @@
-from tornado.httpclient import HTTPClient, HTTPRequest
+from tornado.httpclient import HTTPClient, HTTPRequest, HTTPError
 from tornado.ioloop import IOLoop
 import tornado.options
 import json
@@ -14,6 +14,9 @@ from AmazonEmailParser import AmazonEmailParser
 from SteamEmailParser import SteamEmailParser
 from bs4 import BeautifulSoup
 import logging
+import re
+import email
+from email.header import decode_header
 
 http_client = HTTPClient()
 
@@ -37,12 +40,13 @@ def strip_html_css_js(msg):
 
 def delete_index():
     try:
-        url = "%s/%s?refresh=true" % (tornado.options.options.es_url, tornado.options.options.index_name)
-        request = HTTPRequest(url, method="DELETE", request_timeout=240, headers={"Content-Type": "application/json"})
-        body = {"refresh": True}
+        url = "%s/%s" % (tornado.options.options.es_url, tornado.options.options.index_name)
+        request = HTTPRequest(url, method="DELETE", request_timeout=240)
+        print(url)
         response = http_client.fetch(request)
         logging.info('Delete index done   %s' % response.body)
-    except:
+    except Exception as e:
+        logging.info('Failed: Delete index %s', e)
         pass
 
 def create_index():
@@ -54,14 +58,14 @@ def create_index():
         },
         "mappings": {
             "email": {
-                "_source": {"enabled": True},
                 "properties": {
-                    "from": {"type": "string", "index": "not_analyzed"},
-                    "return-path": {"type": "string", "index": "not_analyzed"},
-                    "delivered-to": {"type": "string", "index": "not_analyzed"},
-                    "message-id": {"type": "string", "index": "not_analyzed"},
-                    "to": {"type": "string", "index": "not_analyzed"},
-                    "date_ts": {"type": "date"},
+                    "from": {"type": "text" },
+                    "return-path": {"type": "text" },
+                    "delivered-to": {"type": "text" },
+  	            "x-gm-threadid" : { "type" : "text", "index": "true" },
+                    "message-id": {"type": "text" },
+                    "to": {"type": "text" },
+                    "date_ts": {"type": "date" },
                 },
             }
         },
@@ -74,7 +78,10 @@ def create_index():
         request = HTTPRequest(url, method="PUT", body=body, request_timeout=240, headers={"Content-Type": "application/json"})
         response = http_client.fetch(request)
         logging.info('Create index done   %s' % response.body)
-    except:
+    except HTTPError as e:
+        logging.info('Failed: Create index %s:%s', e, e.response.body)
+    except Exception as e:
+        logging.info('Failed: Create index %s', e)
         pass
 
 
@@ -95,7 +102,6 @@ def upload_batch(upload_data):
     res_txt = "OK" if not result['errors'] else "FAILED"
     logging.info("Upload: %s - upload took: %4dms, total messages uploaded: %6d" % (res_txt, result['took'], total_uploaded))
 
-
 def normalize_email(email_in):
     parsed = email.utils.parseaddr(email_in)
     return parsed[1]
@@ -107,7 +113,13 @@ def convert_msg_to_json(msg):
         return None
 
     for (k, v) in msg.items():
-        result[k.lower()] = v.decode('utf-8', 'ignore')
+        for h in ['to', 'cc', 'bcc', 'message-id','subject','date', 'from', 'thread-index', 'thread-topic','x-gmail-labels','x-gm-thrid']:
+            pat = re.compile(h, re.IGNORECASE)
+            if pat.match(k):
+		result[k.lower()]  = decode_header(v)[0][0].decode('utf-8', 'ignore')
+
+#    for (k, v) in msg.items():
+#        result[k.lower()] = v.decode('utf-8', 'ignore')
 
     for k in ['to', 'cc', 'bcc']:
         if not result.get(k):
@@ -175,11 +187,14 @@ def load_from_file():
         if count < tornado.options.options.skip:
             continue
         item = convert_msg_to_json(msg)
+
         if item:
             upload_data.append(item)
             if len(upload_data) == tornado.options.options.batch_size:
                 upload_batch(upload_data)
                 upload_data = list()
+        if tornado.options.options.limit > 0 and count > tornado.options.options.limit:
+	   break
 
     # upload remaining items in `upload_batch`
     if upload_data:
@@ -207,6 +222,10 @@ if __name__ == '__main__':
 
     tornado.options.define("skip", type=int, default=0,
                            help="Number of messages to skip from the mbox file")
+
+    tornado.options.define("limit", type=int, default=0,
+                           help="Number of messages to head from mbox file")
+
 
     tornado.options.define("num_of_shards", type=int, default=2,
                            help="Number of shards for ES index")
